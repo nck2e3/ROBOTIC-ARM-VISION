@@ -8,12 +8,15 @@ import select  # For non-blocking console input on Linux
 from pynq.overlays.base import BaseOverlay
 from pynq.lib.video import *
 
+process_frame = True
+
 def process_frames(frame_queue_in, frame_queue_out, cascade_path):
     """Child process to perform face detection on numpy arrays and annotate distance vectors."""
     face_cascade = cv2.CascadeClassifier(cascade_path)
     resized_dims = (800 // 4, 600 // 4)
     scale_x = 800 / resized_dims[0]
     scale_y = 600 / resized_dims[1]
+    global process_frame
 
     while True:
         np_frame = frame_queue_in.get()  # block until we get a numpy array (or None)
@@ -22,63 +25,63 @@ def process_frames(frame_queue_in, frame_queue_out, cascade_path):
             break
 
         try:
-            # Calculate center of the screen based on the current frame dimensions
-            height, width = np_frame.shape[:2]
-            screen_center = (width // 2, height // 2)
+            if(process_frame):
+                # Calculate center of the screen based on the current frame dimensions
+                height, width = np_frame.shape[:2]
+                screen_center = (width // 2, height // 2)
 
-            # Convert to grayscale and resize for face detection
-            np_frame_bw = cv2.cvtColor(np_frame, cv2.COLOR_BGR2GRAY)
-            resized_frame = cv2.resize(np_frame_bw, resized_dims)
+                # Convert to grayscale and resize for face detection
+                np_frame_bw = cv2.cvtColor(np_frame, cv2.COLOR_BGR2GRAY)
+                resized_frame = cv2.resize(np_frame_bw, resized_dims)
 
-            # Detect faces
-            faces = face_cascade.detectMultiScale(resized_frame, 1.3, 5)
+                # Detect faces
+                faces = face_cascade.detectMultiScale(resized_frame, 1.3, 5)
 
-            for (x, y, w, h) in faces:
-                # Scale face detection coordinates back to original frame size
-                x = int(x * scale_x)
-                y = int(y * scale_y)
-                w = int(w * scale_x)
-                h = int(h * scale_y)
+                for (x, y, w, h) in faces:
+                    # Scale face detection coordinates back to original frame size
+                    x = int(x * scale_x)
+                    y = int(y * scale_y)
+                    w = int(w * scale_x)
+                    h = int(h * scale_y)
 
-                # Draw rectangle around face
-                cv2.rectangle(np_frame, (x, y), (x + w, y + h), (0, 0, 0), 2)
+                    # Draw rectangle around face
+                    cv2.rectangle(np_frame, (x, y), (x + w, y + h), (0, 0, 0), 2)
 
-                # Compute the face's center (x + w/2, y + h/2)
-                face_center = (int(x + w / 2), int(y + h / 2))
+                    # Compute the face's center (x + w/2, y + h/2)
+                    face_center = (int(x + w / 2), int(y + h / 2))
 
-                # Draw a line from the screen center to the face center
-                cv2.line(
-                    np_frame,
-                    screen_center,
-                    face_center,
-                    (0, 255, 0),  # line color (B, G, R)
-                    1             # line thickness
-                )
+                    # Draw a line from the screen center to the face center
+                    cv2.line(
+                        np_frame,
+                        screen_center,
+                        face_center,
+                        (0, 255, 0),  # line color (B, G, R)
+                        1             # line thickness
+                    )
 
-                # Calculate the X and Y distance
-                dx = face_center[0] - screen_center[0]
-                dy = face_center[1] - screen_center[1]
+                    # Calculate the X and Y distance
+                    dx = face_center[0] - screen_center[0]
+                    dy = face_center[1] - screen_center[1]
 
-                # Prepare the text to display
-                distance_text = f"(dx={dx}, dy={dy})"
+                    # Prepare the text to display
+                    distance_text = f"(dx={dx}, dy={dy})"
 
-                # Position the text roughly halfway between center and face center
-                text_x = (face_center[0] + screen_center[0]) // 2
-                text_y = (face_center[1] + screen_center[1]) // 2
+                    # Position the text roughly halfway between center and face center
+                    text_x = (face_center[0] + screen_center[0]) // 2
+                    text_y = (face_center[1] + screen_center[1]) // 2
 
-                # Draw the text on the frame
-                cv2.putText(
-                    np_frame,
-                    distance_text,
-                    (text_x, text_y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.33,           # font scale
-                    (0, 0, 255),   # text color (B, G, R) - red here
-                    1,             # text thickness
-                    cv2.LINE_AA
-                )
-
-            # Send processed frame back
+                    # Draw the text on the frame
+                    cv2.putText(
+                        np_frame,
+                        distance_text,
+                        (text_x, text_y),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.33,           # font scale
+                        (0, 0, 255),   # text color (B, G, R) - red here
+                        1,             # text thickness
+                        cv2.LINE_AA
+                    )
+            process_frame = not process_frame
             frame_queue_out.put(np_frame)
 
         except Exception as e:
