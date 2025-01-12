@@ -8,12 +8,12 @@ import select  # For non-blocking console input on Linux
 from pynq.overlays.base import BaseOverlay
 from pynq.lib.video import *
 
-process_frame = True
+process_frame = 0
 
 def process_frames(frame_queue_in, frame_queue_out, cascade_path):
     """Child process to perform face detection on numpy arrays and annotate distance vectors."""
     face_cascade = cv2.CascadeClassifier(cascade_path)
-    resized_dims = (800 // 4, 600 // 4)
+    resized_dims = (800 // 3, 600 // 3)
     scale_x = 800 / resized_dims[0]
     scale_y = 600 / resized_dims[1]
     global process_frame
@@ -24,8 +24,10 @@ def process_frames(frame_queue_in, frame_queue_out, cascade_path):
             # Received sentinel -> time to exit
             break
 
+        start_time = time.time()  # Start measuring latency
+
         try:
-            if(process_frame):
+            if process_frame % 4 == 0:
                 # Calculate center of the screen based on the current frame dimensions
                 height, width = np_frame.shape[:2]
                 screen_center = (width // 2, height // 2)
@@ -45,7 +47,7 @@ def process_frames(frame_queue_in, frame_queue_out, cascade_path):
                     h = int(h * scale_y)
 
                     # Draw rectangle around face
-                    cv2.rectangle(np_frame, (x, y), (x + w, y + h), (0, 0, 0), 2)
+                    cv2.rectangle(np_frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
 
                     # Compute the face's center (x + w/2, y + h/2)
                     face_center = (int(x + w / 2), int(y + h / 2))
@@ -81,14 +83,30 @@ def process_frames(frame_queue_in, frame_queue_out, cascade_path):
                         1,             # text thickness
                         cv2.LINE_AA
                     )
-            process_frame = not process_frame
+                process_frame = 0
+
+            # Calculate FPS
+            latency = time.time() - start_time
+            fps = 1.0 / latency if latency > 0 else 0
+            fps_text = f"FPS: {fps:.2f}"
+
+            # Annotate FPS on the top-left corner of the frame
+            cv2.putText(
+                np_frame,
+                fps_text,
+                (10, 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,            # font scale
+                (255, 255, 255), # text color (white)
+                1,              # text thickness
+                cv2.LINE_AA
+            )
+            
+            process_frame = process_frame + 1
             frame_queue_out.put(np_frame)
 
         except Exception as e:
             print(f"Error processing frame: {e}")
-
-
-
 
 def main():
     # Environment & overlay
@@ -108,7 +126,7 @@ def main():
     hdmi_in.tie(hdmi_out)
 
     # Multiprocessing Queues
-    to_process_queue = multiprocessing.Queue(maxsize=1)
+    to_process_queue = multiprocessing.Queue(maxsize=2)
     processed_queue = multiprocessing.Queue(maxsize=1)
 
     # Create child process
@@ -120,7 +138,7 @@ def main():
     )
     p.start()
 
-    input_fps = 24
+    input_fps = 30
     print("Type anything and press Enter to stop the program...")
 
     # Main loop to capture and display
@@ -136,14 +154,13 @@ def main():
         # 2) Read hardware frame
         pynq_frame = hdmi_in.readframe()
 
-        # 3) Convert it to numpy
-        np_frame = np.copy(pynq_frame)
+       
 
-        # 4) Send numpy frame to child process if queue has space
+        # 3) Send numpy frame to child process if queue has space
         if not to_process_queue.full():
-            to_process_queue.put(np_frame)
+            to_process_queue.put(pynq_frame)
 
-        # 5) If a processed frame is available, display it
+        # 4) If a processed frame is available, display it
         if not processed_queue.empty():
             processed_np_frame = processed_queue.get()
             out_frame = hdmi_out.newframe()
