@@ -3,31 +3,45 @@ import numpy as np
 import cv2
 import time
 import os
+import serial
 import sys
 import select  # For non-blocking console input on Linux
 from pynq.overlays.base import BaseOverlay
 from pynq.lib.video import *
 
+
+# Serial port configuration
+SERIAL_PORT = "/dev/ttyACM0"  # Replace with your serial port (e.g., "/dev/ttyUSB0" on Linux, "COM3" on Windows)
+BAUD_RATE = 115200            # Baud rate (must match STM32 UART configuration)
+ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+
+# Frame Variables
 process_frame = 0
+faces = None
+center_tolerance_px = 50
 
 def process_frames(frame_queue_in, frame_queue_out, cascade_path):
     """Child process to perform face detection on numpy arrays and annotate distance vectors."""
     face_cascade = cv2.CascadeClassifier(cascade_path)
-    resized_dims = (800 // 3, 600 // 3)
+    resized_dims = (800 // 2, 600 // 2)
     scale_x = 800 / resized_dims[0]
     scale_y = 600 / resized_dims[1]
     global process_frame
-
+    global faces
+    global center_tolerance_px
+    global ser
     while True:
-        np_frame = frame_queue_in.get()  # block until we get a numpy array (or None)
+        UART_MSG = "N\n"
+        np_frame = frame_queue_in.get()  # Block until we get a numpy array (or None)
+        start_time = time.time()  # Start measuring latency
+
+        #Exit sentinel to gracefully exit program if there is no input...        
         if np_frame is None:
             # Received sentinel -> time to exit
             break
 
-        start_time = time.time()  # Start measuring latency
-
         try:
-            if process_frame % 4 == 0:
+            if process_frame % 2 == 0:
                 # Calculate center of the screen based on the current frame dimensions
                 height, width = np_frame.shape[:2]
                 screen_center = (width // 2, height // 2)
@@ -37,8 +51,12 @@ def process_frames(frame_queue_in, frame_queue_out, cascade_path):
                 resized_frame = cv2.resize(np_frame_bw, resized_dims)
 
                 # Detect faces
-                faces = face_cascade.detectMultiScale(resized_frame, 1.3, 5)
-
+                faces = face_cascade.detectMultiScale(resized_frame, 1.4, 2)
+                process_frame = 0
+            if faces is not None:
+                closest_face = None
+                min_distance = float('inf')  # Initialize with a very large value
+                
                 for (x, y, w, h) in faces:
                     # Scale face detection coordinates back to original frame size
                     x = int(x * scale_x)
@@ -46,27 +64,42 @@ def process_frames(frame_queue_in, frame_queue_out, cascade_path):
                     w = int(w * scale_x)
                     h = int(h * scale_y)
 
-                    # Draw rectangle around face
-                    cv2.rectangle(np_frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
-
                     # Compute the face's center (x + w/2, y + h/2)
                     face_center = (int(x + w / 2), int(y + h / 2))
 
+                    # Calculate the distance from the screen center to the face center
+                    dx = face_center[0] - screen_center[0]
+                    dy = face_center[1] - screen_center[1]
+                    distance = (dx**2 + dy**2)**0.5
+
+                    # Update the closest face if this one is closer
+                    if distance < min_distance:
+                        min_distance = distance
+                        closest_face = (x, y, w, h, face_center, dx, dy, distance)
+
+                if closest_face is not None:
+                    x, y, w, h, face_center, dx, dy, distance = closest_face
+                    color_tuple = (0,0,0)
+                    if distance <= center_tolerance_px:
+                        UART_MSG = "N\n"  # Message to send
+                        color_tuple = (0,255,0)
+                    else:
+                        UART_MSG = "FLAG\n"
+                        color_tuple = (0,0,255)
+
+                    cv2.rectangle(np_frame, (x, y), (x + w, y + h), color_tuple, 2)
+                    # Draw rectangle around the closest face
                     # Draw a line from the screen center to the face center
                     cv2.line(
                         np_frame,
                         screen_center,
                         face_center,
-                        (0, 255, 0),  # line color (B, G, R)
+                        color_tuple,  # line color (B, G, R)
                         1             # line thickness
                     )
 
-                    # Calculate the X and Y distance
-                    dx = face_center[0] - screen_center[0]
-                    dy = face_center[1] - screen_center[1]
-
                     # Prepare the text to display
-                    distance_text = f"(dx={dx}, dy={dy})"
+                    distance_text = f"(d={distance:.2f}, dx={dx}, dy={dy})"
 
                     # Position the text roughly halfway between center and face center
                     text_x = (face_center[0] + screen_center[0]) // 2
@@ -79,12 +112,14 @@ def process_frames(frame_queue_in, frame_queue_out, cascade_path):
                         (text_x, text_y),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.33,           # font scale
-                        (0, 0, 255),   # text color (B, G, R) - red here
+                        color_tuple,   # text color (B, G, R) - red here
                         1,             # text thickness
                         cv2.LINE_AA
                     )
-                process_frame = 0
 
+                
+            ser.write(UART_MSG.encode())  # Send as bytes
+            
             # Calculate FPS
             latency = time.time() - start_time
             fps = 1.0 / latency if latency > 0 else 0
@@ -126,7 +161,7 @@ def main():
     hdmi_in.tie(hdmi_out)
 
     # Multiprocessing Queues
-    to_process_queue = multiprocessing.Queue(maxsize=2)
+    to_process_queue = multiprocessing.Queue(maxsize=1)
     processed_queue = multiprocessing.Queue(maxsize=1)
 
     # Create child process
@@ -138,7 +173,8 @@ def main():
     )
     p.start()
 
-    input_fps = 30
+    input_fps = 24
+    sleep_interval_seconds = 1 / input_fps
     print("Type anything and press Enter to stop the program...")
 
     # Main loop to capture and display
@@ -154,8 +190,6 @@ def main():
         # 2) Read hardware frame
         pynq_frame = hdmi_in.readframe()
 
-       
-
         # 3) Send numpy frame to child process if queue has space
         if not to_process_queue.full():
             to_process_queue.put(pynq_frame)
@@ -167,7 +201,7 @@ def main():
             out_frame[:] = processed_np_frame  # copy pixels
             hdmi_out.writeframe(out_frame)
 
-        time.sleep(1 / input_fps)
+        time.sleep(sleep_interval_seconds) #Sleep every frame (input capped @ 30fps for throughput)
 
     # --- Cleanup ---
     # Send stop signal to child (None signals it's time to exit)
